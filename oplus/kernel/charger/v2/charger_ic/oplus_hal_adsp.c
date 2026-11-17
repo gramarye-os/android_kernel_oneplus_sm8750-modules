@@ -48,6 +48,7 @@
 #include <oplus_chg_plc.h>
 #include "oplus_pmic_glink_id.h"
 #include <linux/pm_qos.h>
+#include <linux/usb/ucsi_glink.h>
 
 #define BCC_TYPE_IS_SVOOC 1
 #define BCC_TYPE_IS_VOOC 0
@@ -1163,6 +1164,81 @@ static void oplus_typec_disable(void)
 	if (rc < 0) {
 		chg_info("Couldn't write 0x2b44[3] rc=%d\n", rc);
 	}
+}
+
+/*
+ * A dock that already supplies power when the phone attaches, which is
+ * always so when booting docked, leaves the phone as power sink and USB
+ * device. The data role is then swapped to host, and the PD firmware never
+ * enters DisplayPort alt mode, so the monitor stays dark. Turning the
+ * Type-C port off makes the firmware attach again, this time as host, and
+ * alt mode is entered. Only the first such reset after boot has that
+ * effect, so do it once.
+ */
+#define OPLUS_DOCK_RESET_DELAY_MS	3000
+#define OPLUS_DOCK_RESET_DRP_DELAY_MS	5000
+
+static struct delayed_work oplus_dock_reset_work;
+static struct notifier_block oplus_dock_ucsi_nb;
+static bool oplus_dock_reset_done;
+static bool oplus_dock_reset_restore_drp;
+
+static bool oplus_dock_without_alt_mode(const struct ucsi_glink_constat_info *ci)
+{
+	return ci->connect && ci->host && ci->sink && ci->pd &&
+	       !ci->partner_alt_mode;
+}
+
+static int oplus_dock_set_typec_mode(struct battery_chg_dev *bcdev, int mode)
+{
+	if (bcdev->soccp_support)
+		return write_property_id(bcdev, &bcdev->oplus_psy, OPLUS_USB_TYPEC_MODE, mode);
+
+	return write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_USB], USB_TYPEC_MODE, mode);
+}
+
+static void oplus_dock_reset_work_fn(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = g_bcdev;
+	struct ucsi_glink_constat_info ci;
+	int rc;
+
+	if (!bcdev)
+		return;
+
+	if (oplus_dock_reset_restore_drp) {
+		/* the firmware brings the port back by itself; make it explicit */
+		oplus_dock_reset_restore_drp = false;
+		rc = oplus_dock_set_typec_mode(bcdev, QCOM_TYPEC_PORT_ROLE_DRP);
+		if (rc < 0)
+			chg_err("typec mode back to DRP failed, rc=%d\n", rc);
+		return;
+	}
+
+	if (oplus_dock_reset_done)
+		return;
+	if (ucsi_glink_get_constat(&ci) || !oplus_dock_without_alt_mode(&ci))
+		return;
+
+	oplus_dock_reset_done = true;
+	rc = oplus_dock_set_typec_mode(bcdev, QCOM_TYPEC_PORT_ROLE_DISABLE);
+	chg_info("host and sink on a PD partner without alt mode, typec port reset, rc=%d\n", rc);
+
+	oplus_dock_reset_restore_drp = true;
+	schedule_delayed_work(&oplus_dock_reset_work,
+			      msecs_to_jiffies(OPLUS_DOCK_RESET_DRP_DELAY_MS));
+}
+
+static int oplus_dock_ucsi_notify(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	struct ucsi_glink_constat_info *ci = data;
+
+	if (!oplus_dock_reset_done && ci && oplus_dock_without_alt_mode(ci))
+		mod_delayed_work(system_wq, &oplus_dock_reset_work,
+				 msecs_to_jiffies(OPLUS_DOCK_RESET_DELAY_MS));
+
+	return NOTIFY_OK;
 }
 
 static bool is_common_topic_available(struct battery_chg_dev *bcdev)
@@ -13885,6 +13961,12 @@ static int battery_chg_probe(struct platform_device *pdev)
 		schedule_delayed_work(&bcdev->plugin_irq_work, 0);
 	}
 
+	INIT_DELAYED_WORK(&oplus_dock_reset_work, oplus_dock_reset_work_fn);
+	oplus_dock_ucsi_nb.notifier_call = oplus_dock_ucsi_notify;
+	if (!register_ucsi_glink_notifier(&oplus_dock_ucsi_nb))
+		schedule_delayed_work(&oplus_dock_reset_work,
+				      msecs_to_jiffies(OPLUS_DOCK_RESET_DELAY_MS));
+
 	chg_info("battery_chg_probe end...\n");
 #endif
 	return 0;
@@ -13906,6 +13988,10 @@ static int battery_chg_remove(struct platform_device *pdev)
 	if (!IS_ERR_OR_NULL(bcdev->plc_subs))
 		oplus_mms_unsubscribe(bcdev->plc_subs);
 
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	unregister_ucsi_glink_notifier(&oplus_dock_ucsi_nb);
+	cancel_delayed_work_sync(&oplus_dock_reset_work);
+#endif
 	device_init_wakeup(bcdev->dev, false);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
@@ -13968,6 +14054,8 @@ static void battery_chg_shutdown(struct platform_device *pdev)
 	if (bcdev) {
 		chg_err("disable voocphy");
 		cancel_delayed_work_sync(&bcdev->voocphy_enable_check_work);
+		unregister_ucsi_glink_notifier(&oplus_dock_ucsi_nb);
+		cancel_delayed_work_sync(&oplus_dock_reset_work);
 		oplus_typec_disable();
 		oplus_voocphy_enable(bcdev, false);
 		if (bcdev->buck_ic && oplus_chg_get_voocphy_support(bcdev) == ADSP_VOOCPHY) {
